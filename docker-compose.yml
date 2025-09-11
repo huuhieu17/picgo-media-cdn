@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+  media-server:
+    build: .
+    container_name: media-server
+    ports:
+      - "4444:4444"
+    volumes:
+      - ./uploads:/usr/src/app/uploads
+    restart: unless-stopped
