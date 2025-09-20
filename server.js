@@ -1,11 +1,13 @@
+import async from "async";
+import crypto from "crypto";
 import express from "express";
+import ffmpeg from "fluent-ffmpeg";
+import fs from "fs";
 import multer from "multer";
 import path from "path";
-import fs from "fs";
-import crypto from "crypto";
-import ffmpeg from "fluent-ffmpeg";
-
 const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 const PORT = 4444;
 
 // Folders
@@ -28,68 +30,85 @@ const generateFileName = (userId, originalName) => {
   return `${userId}-${timestamp}-${random}${ext}`;
 };
 
-// Multer storage
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, ORIG_DIR),
   filename: (req, file, cb) => {
-    const { userId } = req.body;
+    const userId = req.body.userId || req.query.userId;
+    if (!userId) return cb(new Error("userId is required"));
     cb(null, generateFileName(userId, file.originalname));
   }
 });
 
-const upload = multer({ storage });
+const upload = multer({ storage }).fields([
+  { name: "file", maxCount: 30 }
+]);
 
 // --- Upload chung (ảnh/video) ---
-app.post("/upload", upload.single("file"), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-
-  const ext = path.extname(req.file.filename).toLowerCase();
-
-  // 1. Ảnh → trả URL trực tiếp
-  if (imageExts.includes(ext)) {
-    const fileUrl = `/view/${req.file.filename}`;
-    return res.json({ url: fileUrl });
+app.post("/upload", upload, (req, res) => {
+  const files = req.files?.file; // mảng file
+  if (!files || files.length === 0) {
+    return res.status(400).json({ error: "No file uploaded" });
   }
 
-  // 2. Video → convert HLS
-  if (videoExts.includes(ext)) {
-    const filename = path.basename(req.file.filename, ext);
-    const hlsFolder = path.join(HLS_DIR, filename);
-    if (!fs.existsSync(hlsFolder)) fs.mkdirSync(hlsFolder);
+  const results = [];
 
-    const hlsPath = path.join(hlsFolder, "index.m3u8");
+  const processFile = (file, callback) => {
+    const ext = path.extname(file.filename).toLowerCase();
 
-    ffmpeg(req.file.path)
-      .outputOptions([
-        "-profile:v baseline",
-        "-level 3.0",
-        "-start_number 0",
-        "-hls_time 10",
-        "-hls_list_size 0",
-        "-f hls"
-      ])
-      .output(hlsPath)
-      .on("end", () => {
-        // Xóa file gốc sau khi convert
-        fs.unlink(req.file.path, err => {
-          if (err) console.error("Failed to delete original file:", err);
-        });
+    // 1. Ảnh → trả URL trực tiếp
+    if (imageExts.includes(ext)) {
+      const fileUrl = `${file.filename}`;
+      results.push({ type: "image", url: fileUrl });
+      return callback();
+    }
 
-        const url = `/view/${filename}/index.m3u8`;
-        res.json({ url });
-      })
-      .on("error", err => {
-        console.error(err);
-        res.status(500).json({ error: "Failed to convert video" });
-      })
-      .run();
+    // 2. Video → convert HLS
+    if (videoExts.includes(ext)) {
+      const filename = path.basename(file.filename, ext);
+      const hlsFolder = path.join(HLS_DIR, filename);
+      if (!fs.existsSync(hlsFolder)) fs.mkdirSync(hlsFolder);
 
-    return;
-  }
+      const hlsPath = path.join(hlsFolder, "index.m3u8");
 
-  // 3. File không hỗ trợ → skip
-  fs.unlink(req.file.path, () => {}); // xóa file không hỗ trợ
-  return res.status(400).json({ error: "File type not supported" });
+      ffmpeg(file.path)
+        .outputOptions([
+          "-profile:v baseline",
+          "-level 3.0",
+          "-start_number 0",
+          "-hls_time 10",
+          "-hls_list_size 0",
+          "-f hls"
+        ])
+        .output(hlsPath)
+        .on("end", () => {
+          // Xóa file gốc sau khi convert
+          fs.unlink(file.path, err => {
+            if (err) console.error("Failed to delete original file:", err);
+          });
+
+          const url = `${filename}/index.m3u8`;
+          results.push({ type: "video", url });
+          callback();
+        })
+        .on("error", err => {
+          console.error(err);
+          results.push({ type: "video", error: "Failed to convert video" });
+          callback();
+        })
+        .run();
+      return;
+    }
+
+    // 3. File không hỗ trợ → skip
+    fs.unlink(file.path, () => {});
+    results.push({ type: "unsupported", error: "File type not supported" });
+    return callback();
+  };
+
+
+  async.eachSeries(files, processFile, () => {
+    res.json(results);
+  });
 });
 
 
